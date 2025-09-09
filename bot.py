@@ -23,23 +23,26 @@ logger = logging.getLogger(__name__)
 # Памятка триггеров: watches[chat_id] = {"above": [...], "below": [...]}
 watches: Dict[int, Dict[str, List[float]]] = {}
 
-# ---------- PancakeSwap источники ----------
-# v3 (The Graph)
-GRAPH_API_KEY = os.getenv("GRAPH_API_KEY")  # если не задан, пойдём в v2-фоллбек
+# ---------- источники цен ----------
+# v3 (The Graph / PancakeSwap Exchange v3, BSC)
+GRAPH_API_KEY = os.getenv("GRAPH_API_KEY")  # если пусто — будет фоллбек
 GRAPH_SUBGRAPH_ID = os.getenv(
     "GRAPH_SUBGRAPH_ID",
-    "Hv1GncLY5docZoGtXjo4kwbTvxm3MAhVZqBZE4sUT9eZ"  # PancakeSwap Exchange v3 (BSC)
+    "Hv1GncLY5docZoGtXjo4kwbTvxm3MAhVZqBZE4sUT9eZ"  # официальный subgraph id Pancake v3 (BSC)
 )
 GRAPH_URL = f"https://gateway.thegraph.com/api/subgraphs/id/{GRAPH_SUBGRAPH_ID}"
 
-# v2 (info API)
+# v2 (Pancake Info API)
 PANCAKE_API = os.getenv("PANCAKE_API", "https://api.pancakeswap.info/api/v2/tokens")
+
+# CoinGecko (аварийный фоллбек)
+COINGECKO = "https://api.coingecko.com/api/v3/simple/price"
 
 # Адреса токенов на BSC (в нижнем регистре)
 WBNB = os.getenv("PANCAKE_WBNB", "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c").lower()
 SOL  = os.getenv("PANCAKE_SOL",  "0x570a5d26f7765ecb712c0924e4de545b89fd43df").lower()
 
-# ---------- источники цен ----------
+# ---------- утилиты ----------
 async def _gql(session: aiohttp.ClientSession, query: str, variables: dict):
     if not GRAPH_API_KEY:
         raise RuntimeError("GRAPH_API_KEY не задан")
@@ -52,10 +55,29 @@ async def _gql(session: aiohttp.ClientSession, query: str, variables: dict):
         text = await resp.text()
         resp.raise_for_status()
         data = await resp.json()
-        if "errors" in data and data["errors"]:
+        if data.get("errors"):
             raise RuntimeError(f"GraphQL error: {data['errors']} | body={text[:200]}")
         return data["data"]
 
+async def _get_json_with_retries(session: aiohttp.ClientSession, url: str, *, attempts=3, **kwargs):
+    """GET JSON с ретраями (0.5s, 1.5s, 3s) и обработкой 5xx как ошибок."""
+    delays = [0.5, 1.5, 3.0]
+    last_exc = None
+    for i in range(attempts):
+        try:
+            async with session.get(url, timeout=15, **kwargs) as resp:
+                if resp.status >= 500:
+                    raise RuntimeError(f"HTTP {resp.status}")
+                resp.raise_for_status()
+                return await resp.json()
+        except Exception as e:
+            last_exc = e
+            if i < attempts - 1:
+                await asyncio.sleep(delays[min(i, len(delays)-1)])
+            else:
+                raise last_exc
+
+# ---------- реализации источников ----------
 GQL_QUERY = """
 query Tokens($ids: [ID!]) {
   bundle(id: "1") { bnbPriceUSD }
@@ -68,7 +90,7 @@ query Tokens($ids: [ID!]) {
 """
 
 async def _prices_v3(session: aiohttp.ClientSession) -> Tuple[float, float]:
-    """Возвращает (bnb_usd, sol_usd) через v3 subgraph."""
+    """(bnb_usd, sol_usd) через Pancake v3 subgraph."""
     d = await _gql(session, GQL_QUERY, {"ids": [WBNB, SOL]})
     bnb_usd = float(d["bundle"]["bnbPriceUSD"])
     tokens = {t["id"].lower(): t for t in d["tokens"]}
@@ -78,55 +100,57 @@ async def _prices_v3(session: aiohttp.ClientSession) -> Tuple[float, float]:
     return bnb_usd, sol_usd
 
 async def _prices_v2(session: aiohttp.ClientSession) -> Tuple[float, float]:
-    """Возвращает (bnb_usd, sol_usd) через v2 info API."""
-    async with session.get(f"{PANCAKE_API}/{WBNB}", timeout=15) as r1:
-        r1.raise_for_status()
-        d1 = await r1.json()
-        bnb_usd = float(d1["data"]["price"])
-    async with session.get(f"{PANCAKE_API}/{SOL}", timeout=15) as r2:
-        r2.raise_for_status()
-        d2 = await r2.json()
-        sol_usd = float(d2["data"]["price"])
+    """(bnb_usd, sol_usd) через Pancake Info API v2 с ретраями."""
+    d1 = await _get_json_with_retries(session, f"{PANCAKE_API}/{WBNB}")
+    d2 = await _get_json_with_retries(session, f"{PANCAKE_API}/{SOL}")
+    bnb_usd = float(d1["data"]["price"])
+    sol_usd = float(d2["data"]["price"])
     return bnb_usd, sol_usd
 
+async def _prices_gecko(session: aiohttp.ClientSession) -> Tuple[float, float]:
+    """(bnb_usd, sol_usd) через CoinGecko (аварийный фоллбек)."""
+    params = {"ids": "binancecoin,solana", "vs_currencies": "usd"}
+    async with session.get(COINGECKO, params=params, timeout=15) as r:
+        r.raise_for_status()
+        data = await r.json()
+        bnb = float(data["binancecoin"]["usd"])
+        sol = float(data["solana"]["usd"])
+        return bnb, sol
+
 async def get_bnb_sol_ratio() -> Tuple[float, float, float]:
-    """Пытаемся v3 → если не вышло — падаем в v2. Возвращаем (ratio, bnb_usd, sol_usd)."""
+    """
+    Порядок источников: v3 (The Graph, если задан ключ) → v2 (Info API, с ретраями) → CoinGecko.
+    Возвращает (ratio, bnb_usd, sol_usd)
+    """
     async with aiohttp.ClientSession() as session:
-        # 1) v3 (если есть ключ)
         if GRAPH_API_KEY:
             try:
                 bnb, sol = await _prices_v3(session)
-                ratio = bnb / sol
-                return ratio, bnb, sol
+                return bnb / sol, bnb, sol
             except Exception as e:
-                logger.warning("v3 (The Graph) не сработал: %s — пробуем v2", e)
-        # 2) v2 fallback
-        bnb, sol = await _prices_v2(session)
-        ratio = bnb / sol
-        return ratio, bnb, sol
+                logger.warning("v3 (The Graph) не сработал: %s", e)
+
+        try:
+            bnb, sol = await _prices_v2(session)
+            return bnb / sol, bnb, sol
+        except Exception as e:
+            logger.warning("v2 (Pancake Info API) не сработал: %s", e)
+
+        bnb, sol = await _prices_gecko(session)
+        return bnb / sol, bnb, sol
 
 # ---------- команды ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        "Привет! Я слежу за курсом BNB/SOL (PancakeSwap). Использую v3 (The Graph) с фоллбеком на v2.\n\n"
-        "Команды:\n"
-        "/price — текущий BNB/SOL\n"
-        "/watch_above <число> — алерт, когда BNB/SOL ≥ порога\n"
-        "/watch_below <число> — алерт, когда BNB/SOL ≤ порога\n"
-        "/unwatch — снять все алерты для этого чата\n"
+        "Привет! Я слежу за курсом BNB/SOL (Pancake v3→v2 с аварийным фоллбеком на CoinGecko) и шлю сигналы.\\n\\n"
+        "Команды:\\n"
+        "/price — текущий BNB/SOL\\n"
+        "/watch_above <число> — алерт, когда BNB/SOL ≥ порога\\n"
+        "/watch_below <число> — алерт, когда BNB/SOL ≤ порога\\n"
+        "/unwatch — снять все алерты для этого чата\\n"
         "/list — показать активные алерты"
     )
     await update.message.reply_text(text)
-
-async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    try:
-        ratio, bnb, sol = await get_bnb_sol_ratio()
-        await update.message.reply_text(
-            f"BNB/SOL = {ratio:.6f}\nBNB={bnb:.4f} USD, SOL={sol:.4f} USD (Pancake v3→v2)"
-        )
-    except Exception as e:
-        logger.exception("price cmd failed")
-        await update.message.reply_text(f"Не удалось получить цену: {e}")
 
 def _ensure_chat_entry(chat_id: int) -> None:
     if chat_id not in watches:
@@ -139,6 +163,16 @@ def _parse_threshold(arg_list: List[str]) -> float:
         return float(arg_list[0].replace(",", "."))
     except ValueError:
         raise ValueError("Неверный формат. Пример: 3.2")
+
+async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        ratio, bnb, sol = await get_bnb_sol_ratio()
+        await update.message.reply_text(
+            f"BNB/SOL = {ratio:.6f}\\nBNB={bnb:.4f} USD, SOL={sol:.4f} USD"
+        )
+    except Exception as e:
+        logger.exception("price cmd failed")
+        await update.message.reply_text(f"Не удалось получить цену: {e}")
 
 async def watch_above_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
@@ -181,7 +215,7 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append("⤴️ ABOVE: " + ", ".join(str(x) for x in sorted(above)))
     if below:
         lines.append("⤵️ BELOW: " + ", ".join(str(x) for x in sorted(below)))
-    await update.message.reply_text("\n".join(lines))
+    await update.message.reply_text("\\n".join(lines))
 
 # ---------- проверка & уведомления ----------
 async def _alert_all(app: Application) -> None:
@@ -203,7 +237,7 @@ async def _alert_all(app: Application) -> None:
             hit_msgs.append("⤵️ Достигнуты пороги (≤): " + ", ".join(str(x) for x in fired_below))
             to_remove.setdefault(chat_id, {}).setdefault("below", []).extend(fired_below)
         if hit_msgs:
-            text = "\n".join(hit_msgs) + f"\nBNB/SOL={ratio:.6f} (BNB={bnb:.4f} USD, SOL={sol:.4f} USD, Pancake v3→v2)"
+            text = "\\n".join(hit_msgs) + f"\\nBNB/SOL={ratio:.6f} (BNB={bnb:.4f} USD, SOL={sol:.4f} USD)"
             try:
                 await app.bot.send_message(chat_id=chat_id, text=text)
             except Exception as e:
