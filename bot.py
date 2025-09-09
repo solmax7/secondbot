@@ -2,7 +2,9 @@
 import os
 import asyncio
 import logging
-from typing import Dict, List, Tuple
+import random
+from typing import Dict, List, Tuple, Optional
+from time import time
 
 from dotenv import load_dotenv
 from telegram import Update
@@ -23,12 +25,19 @@ logger = logging.getLogger(__name__)
 # Памятка триггеров: watches[chat_id] = {"above": [...], "below": [...]}
 watches: Dict[int, Dict[str, List[float]]] = {}
 
+# ---------- параметры (можно настраивать через ENV) ----------
+POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "60"))  # реже опрашиваем
+PRICE_TTL_SEC     = int(os.getenv("PRICE_TTL_SEC", "30"))       # сколько кэш валиден
+V3_COOLDOWN_SEC   = int(os.getenv("V3_COOLDOWN_SEC", "20"))
+V2_COOLDOWN_SEC   = int(os.getenv("V2_COOLDOWN_SEC", "60"))
+GECKO_COOLDOWN_SEC= int(os.getenv("GECKO_COOLDOWN_SEC", "120"))
+
 # ---------- источники цен ----------
 # v3 (The Graph / PancakeSwap Exchange v3, BSC)
 GRAPH_API_KEY = os.getenv("GRAPH_API_KEY")  # если пусто — будет фоллбек
 GRAPH_SUBGRAPH_ID = os.getenv(
     "GRAPH_SUBGRAPH_ID",
-    "Hv1GncLY5docZoGtXjo4kwbTvxm3MAhVZqBZE4sUT9eZ"  # официальный subgraph id Pancake v3 (BSC)
+    "Hv1GncLY5docZoGtXjo4kwbTvxm3MAhVZqBZE4sUT9eZ"
 )
 GRAPH_URL = f"https://gateway.thegraph.com/api/subgraphs/id/{GRAPH_SUBGRAPH_ID}"
 
@@ -42,6 +51,22 @@ COINGECKO = "https://api.coingecko.com/api/v3/simple/price"
 WBNB = os.getenv("PANCAKE_WBNB", "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c").lower()
 SOL  = os.getenv("PANCAKE_SOL",  "0x570a5d26f7765ecb712c0924e4de545b89fd43df").lower()
 
+# ---------- состояние кэша ----------
+class PriceState:
+    last_ratio: Optional[float] = None
+    last_bnb: Optional[float] = None
+    last_sol: Optional[float] = None
+    last_source: Optional[str] = None
+    last_updated: float = 0.0
+    last_error: Optional[str] = None
+    cooldowns: Dict[str, float] = {"v3": 0.0, "v2": 0.0, "gecko": 0.0}
+
+state = PriceState()
+
+# ---------- исключение для 429 ----------
+class RateLimitError(Exception):
+    pass
+
 # ---------- утилиты ----------
 async def _gql(session: aiohttp.ClientSession, query: str, variables: dict):
     if not GRAPH_API_KEY:
@@ -53,6 +78,10 @@ async def _gql(session: aiohttp.ClientSession, query: str, variables: dict):
     payload = {"query": query, "variables": variables}
     async with session.post(GRAPH_URL, json=payload, headers=headers, timeout=20) as resp:
         text = await resp.text()
+        if resp.status == 429:
+            raise RateLimitError("429 from The Graph")
+        if resp.status >= 500:
+            raise RuntimeError(f"The Graph HTTP {resp.status}")
         resp.raise_for_status()
         data = await resp.json()
         if data.get("errors"):
@@ -60,12 +89,14 @@ async def _gql(session: aiohttp.ClientSession, query: str, variables: dict):
         return data["data"]
 
 async def _get_json_with_retries(session: aiohttp.ClientSession, url: str, *, attempts=3, **kwargs):
-    """GET JSON с ретраями (0.5s, 1.5s, 3s) и обработкой 5xx как ошибок."""
+    """GET JSON с ретраями (0.5s, 1.5s, 3s), 429 -> RateLimitError, 5xx -> RuntimeError."""
     delays = [0.5, 1.5, 3.0]
     last_exc = None
     for i in range(attempts):
         try:
             async with session.get(url, timeout=15, **kwargs) as resp:
+                if resp.status == 429:
+                    raise RateLimitError("HTTP 429")
                 if resp.status >= 500:
                     raise RuntimeError(f"HTTP {resp.status}")
                 resp.raise_for_status()
@@ -110,44 +141,110 @@ async def _prices_v2(session: aiohttp.ClientSession) -> Tuple[float, float]:
 async def _prices_gecko(session: aiohttp.ClientSession) -> Tuple[float, float]:
     """(bnb_usd, sol_usd) через CoinGecko (аварийный фоллбек)."""
     params = {"ids": "binancecoin,solana", "vs_currencies": "usd"}
-    async with session.get(COINGECKO, params=params, timeout=15) as r:
-        r.raise_for_status()
-        data = await r.json()
+    async with session.get(COINGECKO, params=params, timeout=15) as resp:
+        if resp.status == 429:
+            raise RateLimitError("429 from CoinGecko")
+        if resp.status >= 500:
+            raise RuntimeError(f"CoinGecko HTTP {resp.status}")
+        resp.raise_for_status()
+        data = await resp.json()
         bnb = float(data["binancecoin"]["usd"])
         sol = float(data["solana"]["usd"])
         return bnb, sol
 
-async def get_bnb_sol_ratio() -> Tuple[float, float, float]:
+def _cooldown_set(source: str, seconds: int):
+    # добавим небольшой джиттер, чтобы не бить в ровные секунды
+    jitter = random.uniform(0, seconds * 0.25)
+    state.cooldowns[source] = time() + seconds + jitter
+
+def _cooldown_active(source: str) -> bool:
+    return time() < state.cooldowns.get(source, 0.0)
+
+async def _fetch_and_update() -> bool:
     """
-    Порядок источников: v3 (The Graph, если задан ключ) → v2 (Info API, с ретраями) → CoinGecko.
-    Возвращает (ratio, bnb_usd, sol_usd)
+    Пытаемся обновить цену в state по порядку источников, учитывая cooldown.
+    Возвращает True, если обновили.
     """
     async with aiohttp.ClientSession() as session:
-        if GRAPH_API_KEY:
+        # 1) v3
+        if GRAPH_API_KEY and not _cooldown_active("v3"):
             try:
                 bnb, sol = await _prices_v3(session)
-                return bnb / sol, bnb, sol
+                state.last_ratio, state.last_bnb, state.last_sol = bnb/sol, bnb, sol
+                state.last_source = "v3"
+                state.last_updated = time()
+                state.last_error = None
+                return True
+            except RateLimitError as e:
+                logger.warning("RateLimited v3: %s", e)
+                _cooldown_set("v3", V3_COOLDOWN_SEC)
+                state.last_error = str(e)
             except Exception as e:
-                logger.warning("v3 (The Graph) не сработал: %s", e)
+                logger.warning("v3 error: %s", e)
+                _cooldown_set("v3", V3_COOLDOWN_SEC)
+                state.last_error = str(e)
 
-        try:
-            bnb, sol = await _prices_v2(session)
-            return bnb / sol, bnb, sol
-        except Exception as e:
-            logger.warning("v2 (Pancake Info API) не сработал: %s", e)
+        # 2) v2
+        if not _cooldown_active("v2"):
+            try:
+                bnb, sol = await _prices_v2(session)
+                state.last_ratio, state.last_bnb, state.last_sol = bnb/sol, bnb, sol
+                state.last_source = "v2"
+                state.last_updated = time()
+                state.last_error = None
+                return True
+            except RateLimitError as e:
+                logger.warning("RateLimited v2: %s", e)
+                _cooldown_set("v2", V2_COOLDOWN_SEC)
+                state.last_error = str(e)
+            except Exception as e:
+                logger.warning("v2 error: %s", e)
+                _cooldown_set("v2", V2_COOLDOWN_SEC)
+                state.last_error = str(e)
 
-        bnb, sol = await _prices_gecko(session)
-        return bnb / sol, bnb, sol
+        # 3) gecko
+        if not _cooldown_active("gecko"):
+            try:
+                bnb, sol = await _prices_gecko(session)
+                state.last_ratio, state.last_bnb, state.last_sol = bnb/sol, bnb, sol
+                state.last_source = "gecko"
+                state.last_updated = time()
+                state.last_error = None
+                return True
+            except RateLimitError as e:
+                logger.warning("RateLimited gecko: %s", e)
+                _cooldown_set("gecko", GECKO_COOLDOWN_SEC)
+                state.last_error = str(e)
+            except Exception as e:
+                logger.warning("gecko error: %s", e)
+                _cooldown_set("gecko", GECKO_COOLDOWN_SEC)
+                state.last_error = str(e)
+
+    return False
+
+async def ensure_price(force_refresh: bool = False) -> Tuple[float, float, float, str, bool]:
+    """
+    Возвращает (ratio, bnb, sol, source, stale).
+    Если кэш старше PRICE_TTL_SEC или force_refresh=True — пытаемся обновить.
+    """
+    stale = (time() - state.last_updated) > PRICE_TTL_SEC
+    if force_refresh or stale or state.last_ratio is None:
+        updated = await _fetch_and_update()
+        stale = not updated and state.last_ratio is not None
+        if state.last_ratio is None and not updated:
+            # вообще нет данных
+            raise RuntimeError(state.last_error or "нет данных от источников")
+    return state.last_ratio, state.last_bnb, state.last_sol, state.last_source or "n/a", stale
 
 # ---------- команды ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        "Привет! Я слежу за курсом BNB/SOL (Pancake v3→v2 с аварийным фоллбеком на CoinGecko) и шлю сигналы.\\n\\n"
-        "Команды:\\n"
-        "/price — текущий BNB/SOL\\n"
-        "/watch_above <число> — алерт, когда BNB/SOL ≥ порога\\n"
-        "/watch_below <число> — алерт, когда BNB/SOL ≤ порога\\n"
-        "/unwatch — снять все алерты для этого чата\\n"
+        "Привет! Я слежу за курсом BNB/SOL и шлю сигналы.\n\n"
+        "Команды:\n"
+        "/price — текущий BNB/SOL\n"
+        "/watch_above <число> — алерт, когда BNB/SOL ≥ порога\n"
+        "/watch_below <число> — алерт, когда BNB/SOL ≤ порога\n"
+        "/unwatch — снять все алерты для этого чата\n"
         "/list — показать активные алерты"
     )
     await update.message.reply_text(text)
@@ -166,9 +263,12 @@ def _parse_threshold(arg_list: List[str]) -> float:
 
 async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
-        ratio, bnb, sol = await get_bnb_sol_ratio()
+        ratio, bnb, sol, source, stale = await ensure_price(force_refresh=False)
+        stale_note = " (stale)" if stale else ""
         await update.message.reply_text(
-            f"BNB/SOL = {ratio:.6f}\\nBNB={bnb:.4f} USD, SOL={sol:.4f} USD"
+            f"BNB/SOL = {ratio:.6f}{stale_note}\n"
+            f"BNB={bnb:.4f} USD, SOL={sol:.4f} USD\n"
+            f"source={source}"
         )
     except Exception as e:
         logger.exception("price cmd failed")
@@ -215,14 +315,14 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append("⤴️ ABOVE: " + ", ".join(str(x) for x in sorted(above)))
     if below:
         lines.append("⤵️ BELOW: " + ", ".join(str(x) for x in sorted(below)))
-    await update.message.reply_text("\\n".join(lines))
+    await update.message.reply_text("\n".join(lines))
 
 # ---------- проверка & уведомления ----------
-async def _alert_all(app: Application) -> None:
+async def _check_and_alert(app: Application) -> None:
     try:
-        ratio, bnb, sol = await get_bnb_sol_ratio()
+        ratio, bnb, sol, source, stale = await ensure_price(force_refresh=False)
     except Exception as e:
-        logger.warning("Не удалось получить цены: %s", e)
+        logger.warning("Не удалось обновить цены для алертов: %s", e)
         return
 
     to_remove: Dict[int, Dict[str, List[float]]] = {}
@@ -237,7 +337,8 @@ async def _alert_all(app: Application) -> None:
             hit_msgs.append("⤵️ Достигнуты пороги (≤): " + ", ".join(str(x) for x in fired_below))
             to_remove.setdefault(chat_id, {}).setdefault("below", []).extend(fired_below)
         if hit_msgs:
-            text = "\\n".join(hit_msgs) + f"\\nBNB/SOL={ratio:.6f} (BNB={bnb:.4f} USD, SOL={sol:.4f} USD)"
+            stale_note = " (stale)" if stale else ""
+            text = "\n".join(hit_msgs) + f"\nBNB/SOL={ratio:.6f}{stale_note} (src={source})"
             try:
                 await app.bot.send_message(chat_id=chat_id, text=text)
             except Exception as e:
@@ -251,9 +352,9 @@ async def _alert_all(app: Application) -> None:
 
 async def _background_loop(app: Application, interval: int) -> None:
     await asyncio.sleep(5)
-    logger.warning("Запущен asyncio-таймер: интервал %s сек", interval)
+    logger.info("Запущен asyncio-таймер: интервал %s сек", interval)
     while True:
-        await _alert_all(app)
+        await _check_and_alert(app)
         await asyncio.sleep(interval)
 
 # ---------- init & main ----------
@@ -270,21 +371,19 @@ def main() -> None:
     app.add_handler(CommandHandler("watch_below", watch_below_cmd))
     app.add_handler(CommandHandler("unwatch", unwatch_cmd))
     app.add_handler(CommandHandler("list", list_cmd))
-    # на обычный текст просто показываем текущий курс
+    # на обычный текст просто показываем текущий курс (не форсим обновление)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, price_cmd))
 
-    interval = int(os.getenv("POLL_INTERVAL_SEC", "30"))
-
-    # Если установлен extra job-queue — используем его, иначе fallback на asyncio
+    # Планировщик/таймер
     jq = getattr(app, "job_queue", None)
     if jq is not None:
-        jq.run_repeating(lambda ctx: _alert_all(app), interval=interval, first=5)
-        logger.info("JobQueue активен (интервал %s сек)", interval)
+        jq.run_repeating(lambda ctx: _check_and_alert(app), interval=POLL_INTERVAL_SEC, first=5)
+        logger.info("JobQueue активен (интервал %s сек)", POLL_INTERVAL_SEC)
     else:
         try:
-            app.create_task(_background_loop(app, interval))
+            app.create_task(_background_loop(app, POLL_INTERVAL_SEC))
         except Exception:
-            asyncio.get_event_loop().create_task(_background_loop(app, interval))
+            asyncio.get_event_loop().create_task(_background_loop(app, POLL_INTERVAL_SEC))
         logger.warning("JobQueue не обнаружен — используем asyncio fallback")
 
     app.run_polling(close_loop=False)
