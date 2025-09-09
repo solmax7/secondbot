@@ -23,19 +23,38 @@ logger = logging.getLogger(__name__)
 # Памятка триггеров: watches[chat_id] = {"above": [...], "below": [...]}
 watches: Dict[int, Dict[str, List[float]]] = {}
 
-# ---------- PancakeSwap v3 (Subgraph on The Graph) ----------
-# Источник: https://developer.pancakeswap.finance/apis/subgraph  (Exchange v3 / BSC)
-# Для запроса к dGraph нужен API-ключ The Graph (бесплатно получить в Studio).
-GRAPH_API_KEY = os.getenv("GRAPH_API_KEY")  # ОБЯЗАТЕЛЬНО задать
+# ---------- PancakeSwap источники ----------
+# v3 (The Graph)
+GRAPH_API_KEY = os.getenv("GRAPH_API_KEY")  # если не задан, пойдём в v2-фоллбек
 GRAPH_SUBGRAPH_ID = os.getenv(
     "GRAPH_SUBGRAPH_ID",
-    "Hv1GncLY5docZoGtXjo4kwbTvxm3MAhVZqBZE4sUT9eZ"  # Exchange (v3) BSC
+    "Hv1GncLY5docZoGtXjo4kwbTvxm3MAhVZqBZE4sUT9eZ"  # PancakeSwap Exchange v3 (BSC)
 )
 GRAPH_URL = f"https://gateway.thegraph.com/api/subgraphs/id/{GRAPH_SUBGRAPH_ID}"
+
+# v2 (info API)
+PANCAKE_API = os.getenv("PANCAKE_API", "https://api.pancakeswap.info/api/v2/tokens")
 
 # Адреса токенов на BSC (в нижнем регистре)
 WBNB = os.getenv("PANCAKE_WBNB", "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c").lower()
 SOL  = os.getenv("PANCAKE_SOL",  "0x570a5d26f7765ecb712c0924e4de545b89fd43df").lower()
+
+# ---------- источники цен ----------
+async def _gql(session: aiohttp.ClientSession, query: str, variables: dict):
+    if not GRAPH_API_KEY:
+        raise RuntimeError("GRAPH_API_KEY не задан")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {GRAPH_API_KEY}",
+    }
+    payload = {"query": query, "variables": variables}
+    async with session.post(GRAPH_URL, json=payload, headers=headers, timeout=20) as resp:
+        text = await resp.text()
+        resp.raise_for_status()
+        data = await resp.json()
+        if "errors" in data and data["errors"]:
+            raise RuntimeError(f"GraphQL error: {data['errors']} | body={text[:200]}")
+        return data["data"]
 
 GQL_QUERY = """
 query Tokens($ids: [ID!]) {
@@ -48,42 +67,48 @@ query Tokens($ids: [ID!]) {
 }
 """
 
-async def _gql(session: aiohttp.ClientSession, query: str, variables: dict):
-    if not GRAPH_API_KEY:
-        raise RuntimeError("Не задан GRAPH_API_KEY для The Graph")
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {GRAPH_API_KEY}",
-    }
-    payload = {"query": query, "variables": variables}
-    async with session.post(GRAPH_URL, json=payload, headers=headers, timeout=20) as resp:
-        txt = await resp.text()
-        resp.raise_for_status()
-        data = await resp.json()
-        if "errors" in data and data["errors"]:
-            raise RuntimeError(f"GraphQL error: {data['errors']} | body={txt[:200]}")
-        return data["data"]
+async def _prices_v3(session: aiohttp.ClientSession) -> Tuple[float, float]:
+    """Возвращает (bnb_usd, sol_usd) через v3 subgraph."""
+    d = await _gql(session, GQL_QUERY, {"ids": [WBNB, SOL]})
+    bnb_usd = float(d["bundle"]["bnbPriceUSD"])
+    tokens = {t["id"].lower(): t for t in d["tokens"]}
+    if SOL not in tokens:
+        raise RuntimeError("SOL не найден в subgraph v3")
+    sol_usd = float(tokens[SOL]["derivedBNB"]) * bnb_usd
+    return bnb_usd, sol_usd
+
+async def _prices_v2(session: aiohttp.ClientSession) -> Tuple[float, float]:
+    """Возвращает (bnb_usd, sol_usd) через v2 info API."""
+    async with session.get(f"{PANCAKE_API}/{WBNB}", timeout=15) as r1:
+        r1.raise_for_status()
+        d1 = await r1.json()
+        bnb_usd = float(d1["data"]["price"])
+    async with session.get(f"{PANCAKE_API}/{SOL}", timeout=15) as r2:
+        r2.raise_for_status()
+        d2 = await r2.json()
+        sol_usd = float(d2["data"]["price"])
+    return bnb_usd, sol_usd
 
 async def get_bnb_sol_ratio() -> Tuple[float, float, float]:
-    """
-    Возвращает (ratio, bnb_usd, sol_usd) через PancakeSwap v3 subgraph:
-    ratio = BNB_USD / SOL_USD
-    """
+    """Пытаемся v3 → если не вышло — падаем в v2. Возвращаем (ratio, bnb_usd, sol_usd)."""
     async with aiohttp.ClientSession() as session:
-        d = await _gql(session, GQL_QUERY, {"ids": [WBNB, SOL]})
-        bnb_usd = float(d["bundle"]["bnbPriceUSD"])
-        tokens = {t["id"].lower(): t for t in d["tokens"]}
-        if SOL not in tokens:
-            raise RuntimeError("SOL не найден в v3 subgraph")
-        sol_derived_bnb = float(tokens[SOL]["derivedBNB"])
-        sol_usd = sol_derived_bnb * bnb_usd
-        ratio = bnb_usd / sol_usd
-        return ratio, bnb_usd, sol_usd
+        # 1) v3 (если есть ключ)
+        if GRAPH_API_KEY:
+            try:
+                bnb, sol = await _prices_v3(session)
+                ratio = bnb / sol
+                return ratio, bnb, sol
+            except Exception as e:
+                logger.warning("v3 (The Graph) не сработал: %s — пробуем v2", e)
+        # 2) v2 fallback
+        bnb, sol = await _prices_v2(session)
+        ratio = bnb / sol
+        return ratio, bnb, sol
 
 # ---------- команды ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        "Привет! Я слежу за курсом BNB/SOL (данные PancakeSwap v3 / The Graph) и шлю сигналы.\n\n"
+        "Привет! Я слежу за курсом BNB/SOL (PancakeSwap). Использую v3 (The Graph) с фоллбеком на v2.\n\n"
         "Команды:\n"
         "/price — текущий BNB/SOL\n"
         "/watch_above <число> — алерт, когда BNB/SOL ≥ порога\n"
@@ -97,11 +122,11 @@ async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         ratio, bnb, sol = await get_bnb_sol_ratio()
         await update.message.reply_text(
-            f"BNB/SOL = {ratio:.6f}\nBNB={bnb:.4f} USD, SOL={sol:.4f} USD (Pancake v3)"
+            f"BNB/SOL = {ratio:.6f}\nBNB={bnb:.4f} USD, SOL={sol:.4f} USD (Pancake v3→v2)"
         )
     except Exception as e:
         logger.exception("price cmd failed")
-        await update.message.reply_text(f"Не удалось получить цену (Pancake v3): {e}")
+        await update.message.reply_text(f"Не удалось получить цену: {e}")
 
 def _ensure_chat_entry(chat_id: int) -> None:
     if chat_id not in watches:
@@ -178,7 +203,7 @@ async def _alert_all(app: Application) -> None:
             hit_msgs.append("⤵️ Достигнуты пороги (≤): " + ", ".join(str(x) for x in fired_below))
             to_remove.setdefault(chat_id, {}).setdefault("below", []).extend(fired_below)
         if hit_msgs:
-            text = "\n".join(hit_msgs) + f"\nBNB/SOL={ratio:.6f} (BNB={bnb:.4f} USD, SOL={sol:.4f} USD, Pancake v3)"
+            text = "\n".join(hit_msgs) + f"\nBNB/SOL={ratio:.6f} (BNB={bnb:.4f} USD, SOL={sol:.4f} USD, Pancake v3→v2)"
             try:
                 await app.bot.send_message(chat_id=chat_id, text=text)
             except Exception as e:
