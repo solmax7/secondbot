@@ -1,4 +1,3 @@
-
 import os
 import asyncio
 import logging
@@ -7,9 +6,9 @@ from typing import Dict, List, Tuple, Optional
 from time import time
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ContextTypes, filters,
+    Application, CommandHandler, MessageHandler, ContextTypes, CallbackQueryHandler, filters,
 )
 import aiohttp
 
@@ -22,12 +21,12 @@ if not TOKEN:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Памятка триггеров: watches[chat_id] = {"above": [...], "below": [...]}
+# Хранилище триггеров: watches[chat_id] = {"above": [...], "below": [...]}
 watches: Dict[int, Dict[str, List[float]]] = {}
 
-# ---------- параметры (можно настраивать через ENV) ----------
+# ---------- параметры (ENV-переменные) ----------
 POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "60"))  # реже опрашиваем
-PRICE_TTL_SEC     = int(os.getenv("PRICE_TTL_SEC", "30"))       # сколько кэш валиден
+PRICE_TTL_SEC     = int(os.getenv("PRICE_TTL_SEC", "30"))       # валидность кэша
 V3_COOLDOWN_SEC   = int(os.getenv("V3_COOLDOWN_SEC", "20"))
 V2_COOLDOWN_SEC   = int(os.getenv("V2_COOLDOWN_SEC", "60"))
 GECKO_COOLDOWN_SEC= int(os.getenv("GECKO_COOLDOWN_SEC", "120"))
@@ -63,7 +62,6 @@ class PriceState:
 
 state = PriceState()
 
-# ---------- исключение для 429 ----------
 class RateLimitError(Exception):
     pass
 
@@ -121,7 +119,6 @@ query Tokens($ids: [ID!]) {
 """
 
 async def _prices_v3(session: aiohttp.ClientSession) -> Tuple[float, float]:
-    """(bnb_usd, sol_usd) через Pancake v3 subgraph."""
     d = await _gql(session, GQL_QUERY, {"ids": [WBNB, SOL]})
     bnb_usd = float(d["bundle"]["bnbPriceUSD"])
     tokens = {t["id"].lower(): t for t in d["tokens"]}
@@ -131,7 +128,6 @@ async def _prices_v3(session: aiohttp.ClientSession) -> Tuple[float, float]:
     return bnb_usd, sol_usd
 
 async def _prices_v2(session: aiohttp.ClientSession) -> Tuple[float, float]:
-    """(bnb_usd, sol_usd) через Pancake Info API v2 с ретраями."""
     d1 = await _get_json_with_retries(session, f"{PANCAKE_API}/{WBNB}")
     d2 = await _get_json_with_retries(session, f"{PANCAKE_API}/{SOL}")
     bnb_usd = float(d1["data"]["price"])
@@ -139,7 +135,6 @@ async def _prices_v2(session: aiohttp.ClientSession) -> Tuple[float, float]:
     return bnb_usd, sol_usd
 
 async def _prices_gecko(session: aiohttp.ClientSession) -> Tuple[float, float]:
-    """(bnb_usd, sol_usd) через CoinGecko (аварийный фоллбек)."""
     params = {"ids": "binancecoin,solana", "vs_currencies": "usd"}
     async with session.get(COINGECKO, params=params, timeout=15) as resp:
         if resp.status == 429:
@@ -153,7 +148,6 @@ async def _prices_gecko(session: aiohttp.ClientSession) -> Tuple[float, float]:
         return bnb, sol
 
 def _cooldown_set(source: str, seconds: int):
-    # добавим небольшой джиттер, чтобы не бить в ровные секунды
     jitter = random.uniform(0, seconds * 0.25)
     state.cooldowns[source] = time() + seconds + jitter
 
@@ -161,10 +155,6 @@ def _cooldown_active(source: str) -> bool:
     return time() < state.cooldowns.get(source, 0.0)
 
 async def _fetch_and_update() -> bool:
-    """
-    Пытаемся обновить цену в state по порядку источников, учитывая cooldown.
-    Возвращает True, если обновили.
-    """
     async with aiohttp.ClientSession() as session:
         # 1) v3
         if GRAPH_API_KEY and not _cooldown_active("v3"):
@@ -222,33 +212,175 @@ async def _fetch_and_update() -> bool:
 
     return False
 
-async def ensure_price(force_refresh: bool = False) -> Tuple[float, float, float, str, bool]:
-    """
-    Возвращает (ratio, bnb, sol, source, stale).
-    Если кэш старше PRICE_TTL_SEC или force_refresh=True — пытаемся обновить.
-    """
+async def ensure_price(force_refresh: bool = False):
+    """Возвращает (ratio, bnb, sol, source, stale)."""
     stale = (time() - state.last_updated) > PRICE_TTL_SEC
     if force_refresh or stale or state.last_ratio is None:
         updated = await _fetch_and_update()
         stale = not updated and state.last_ratio is not None
         if state.last_ratio is None and not updated:
-            # вообще нет данных
             raise RuntimeError(state.last_error or "нет данных от источников")
     return state.last_ratio, state.last_bnb, state.last_sol, state.last_source or "n/a", stale
 
+# ---------- UI (кнопки) ----------
+def _fmt_main_text(ratio: float, bnb: float, sol: float, source: str, stale: bool) -> str:
+    stale_note = " (stale)" if stale else ""
+    return (
+        f"BNB/SOL = {ratio:.6f}{stale_note}\n"
+        f"BNB={bnb:.4f} USD, SOL={sol:.4f} USD\n"
+        f"source={source}"
+    )
+
+def _build_main_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📈 Обновить цену", callback_data="price:refresh")],
+        [
+            InlineKeyboardButton("➕ Вверх-алерт", callback_data="watch:menu_above"),
+            InlineKeyboardButton("➖ Вниз-алерт", callback_data="watch:menu_below"),
+        ],
+        [
+            InlineKeyboardButton("🔔 Список", callback_data="alerts:list"),
+            InlineKeyboardButton("🧹 Сбросить", callback_data="alerts:clear"),
+        ],
+    ])
+
+def _preset_thresholds(ratio: float):
+    above = [round(ratio * m, 4) for m in (1.02, 1.05, 1.10)]
+    below = [round(ratio * m, 4) for m in (0.98, 0.95, 0.90)]
+    return above, below
+
+def _build_watch_kb(ratio: float, kind: str) -> InlineKeyboardMarkup:
+    above, below = _preset_thresholds(ratio)
+    if kind == "above":
+        row = [InlineKeyboardButton(f"{v}", callback_data=f"watch:above:{v}") for v in above]
+        extra = InlineKeyboardButton("✏️ Свой", callback_data="watch:custom_above")
+    else:
+        row = [InlineKeyboardButton(f"{v}", callback_data=f"watch:below:{v}") for v in below]
+        extra = InlineKeyboardButton("✏️ Свой", callback_data="watch:custom_below")
+    return InlineKeyboardMarkup([
+        row,
+        [extra],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="nav:back")],
+    ])
+
 # ---------- команды ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (
-        "Привет! Я слежу за курсом BNB/SOL и шлю сигналы.\n\n"
-        "Команды:\n"
-        "/price — текущий BNB/SOL\n"
-        "/watch_above <число> — алерт, когда BNB/SOL ≥ порога\n"
-        "/watch_below <число> — алерт, когда BNB/SOL ≤ порога\n"
-        "/unwatch — снять все алерты для этого чата\n"
-        "/list — показать активные алерты"
-    )
-    await update.message.reply_text(text)
+    try:
+        ratio, bnb, sol, source, stale = await ensure_price(force_refresh=False)
+        await update.message.reply_text(
+            _fmt_main_text(ratio, bnb, sol, source, stale),
+            reply_markup=_build_main_kb(),
+        )
+    except Exception as e:
+        await update.message.reply_text("Готов к работе. Нажми '📈 Обновить цену' или /price",
+                                        reply_markup=_build_main_kb())
 
+async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        ratio, bnb, sol, source, stale = await ensure_price(force_refresh=False)
+        await update.message.reply_text(
+            _fmt_main_text(ratio, bnb, sol, source, stale),
+            reply_markup=_build_main_kb(),
+        )
+    except Exception as e:
+        logger.exception("price cmd failed")
+        await update.message.reply_text(f"Не удалось получить цену: {e}", reply_markup=_build_main_kb())
+
+async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    ab = watches.get(chat_id, {}).get("above", [])
+    bl = watches.get(chat_id, {}).get("below", [])
+    if not ab and not bl:
+        text = "Алертов нет. Задай через кнопки или команды /watch_above и /watch_below."
+    else:
+        parts = []
+        if ab:
+            parts.append("⤴️ ABOVE: " + ", ".join(map(str, sorted(ab))))
+        if bl:
+            parts.append("⤵️ BELOW: " + ", ".join(map(str, sorted(bl))))
+        text = "\n".join(parts)
+    await update.message.reply_text(text, reply_markup=_build_main_kb())
+
+# ---------- обработка callback-кнопок ----------
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+    chat_id = q.message.chat_id
+
+    try:
+        if data == "price:refresh":
+            ratio, bnb, sol, source, stale = await ensure_price(force_refresh=True)
+            await q.edit_message_text(
+                _fmt_main_text(ratio, bnb, sol, source, stale),
+                reply_markup=_build_main_kb()
+            )
+            return
+
+        if data == "alerts:list":
+            ab = watches.get(chat_id, {}).get("above", [])
+            bl = watches.get(chat_id, {}).get("below", [])
+            if not ab and not bl:
+                text = "Алертов нет."
+            else:
+                parts = []
+                if ab: parts.append("⤴️ ABOVE: " + ", ".join(map(str, sorted(ab))))
+                if bl: parts.append("⤵️ BELOW: " + ", ".join(map(str, sorted(bl))))
+                text = "\n".join(parts)
+            await q.edit_message_text(text, reply_markup=_build_main_kb())
+            return
+
+        if data == "alerts:clear":
+            watches.pop(chat_id, None)
+            await q.edit_message_text("Все алерты сброшены.", reply_markup=_build_main_kb())
+            return
+
+        if data in ("watch:menu_above", "watch:menu_below"):
+            kind = "above" if data.endswith("above") else "below"
+            ratio, bnb, sol, source, stale = await ensure_price(force_refresh=False)
+            await q.edit_message_text(
+                f"Выбери порог для {('⤴️ ABOVE' if kind=='above' else '⤵️ BELOW')}",
+                reply_markup=_build_watch_kb(ratio, kind)
+            )
+            return
+
+        if data.startswith("watch:above:"):
+            thr = float(data.split(":", 2)[2])
+            watches.setdefault(chat_id, {"above": [], "below": []})["above"].append(thr)
+            await q.edit_message_text(f"Ок! Сообщу, когда BNB/SOL ≥ {thr}", reply_markup=_build_main_kb())
+            return
+
+        if data.startswith("watch:below:"):
+            thr = float(data.split(":", 2)[2])
+            watches.setdefault(chat_id, {"above": [], "below": []})["below"].append(thr)
+            await q.edit_message_text(f"Ок! Сообщу, когда BNB/SOL ≤ {thr}", reply_markup=_build_main_kb())
+            return
+
+        if data in ("watch:custom_above", "watch:custom_below"):
+            direction = "выше (≥)" if data.endswith("above") else "ниже (≤)"
+            hint = "/watch_above X" if data.endswith("above") else "/watch_below X"
+            await q.edit_message_text(
+                f"Введи свой порог числом. Напр.: {hint}\nСейчас удобно взять от текущей цены +/- 5%, 10%.",
+                reply_markup=_build_main_kb()
+            )
+            return
+
+        if data == "nav:back":
+            ratio, bnb, sol, source, stale = await ensure_price(force_refresh=False)
+            await q.edit_message_text(
+                _fmt_main_text(ratio, bnb, sol, source, stale),
+                reply_markup=_build_main_kb()
+            )
+            return
+
+        # fallback
+        await q.edit_message_text("Неизвестная команда.", reply_markup=_build_main_kb())
+
+    except Exception as e:
+        logger.exception("callback failed")
+        await q.edit_message_text(f"Ошибка: {e}", reply_markup=_build_main_kb())
+
+# ---------- ручные команды /watch_* и /unwatch ----------
 def _ensure_chat_entry(chat_id: int) -> None:
     if chat_id not in watches:
         watches[chat_id] = {"above": [], "below": []}
@@ -261,28 +393,15 @@ def _parse_threshold(arg_list: List[str]) -> float:
     except ValueError:
         raise ValueError("Неверный формат. Пример: 3.2")
 
-async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    try:
-        ratio, bnb, sol, source, stale = await ensure_price(force_refresh=False)
-        stale_note = " (stale)" if stale else ""
-        await update.message.reply_text(
-            f"BNB/SOL = {ratio:.6f}{stale_note}\n"
-            f"BNB={bnb:.4f} USD, SOL={sol:.4f} USD\n"
-            f"source={source}"
-        )
-    except Exception as e:
-        logger.exception("price cmd failed")
-        await update.message.reply_text(f"Не удалось получить цену: {e}")
-
 async def watch_above_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         thr = _parse_threshold(context.args)
         chat_id = update.effective_chat.id
         _ensure_chat_entry(chat_id)
         watches[chat_id]["above"].append(thr)
-        await update.message.reply_text(f"Ок! Сообщу, когда BNB/SOL ≥ {thr}")
+        await update.message.reply_text(f"Ок! Сообщу, когда BNB/SOL ≥ {thr}", reply_markup=_build_main_kb())
     except Exception as e:
-        await update.message.reply_text(str(e))
+        await update.message.reply_text(str(e), reply_markup=_build_main_kb())
 
 async def watch_below_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
@@ -290,34 +409,20 @@ async def watch_below_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         chat_id = update.effective_chat.id
         _ensure_chat_entry(chat_id)
         watches[chat_id]["below"].append(thr)
-        await update.message.reply_text(f"Ок! Сообщу, когда BNB/SOL ≤ {thr}")
+        await update.message.reply_text(f"Ок! Сообщу, когда BNB/SOL ≤ {thr}", reply_markup=_build_main_kb())
     except Exception as e:
-        await update.message.reply_text(str(e))
+        await update.message.reply_text(str(e), reply_markup=_build_main_kb())
 
 async def unwatch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    if chat_id in watches:
-        watches.pop(chat_id)
-        await update.message.reply_text("Все алерты для этого чата сброшены.")
-    else:
-        await update.message.reply_text("Алертов не было.")
+    watches.pop(chat_id, None)
+    await update.message.reply_text("Все алерты для этого чата сброшены.", reply_markup=_build_main_kb())
 
-async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id
-    _ensure_chat_entry(chat_id)
-    above = watches[chat_id]["above"]
-    below = watches[chat_id]["below"]
-    if not above and not below:
-        await update.message.reply_text("Алертов пока нет. Используй /watch_above или /watch_below.")
-        return
-    lines = []
-    if above:
-        lines.append("⤴️ ABOVE: " + ", ".join(str(x) for x in sorted(above)))
-    if below:
-        lines.append("⤵️ BELOW: " + ", ".join(str(x) for x in sorted(below)))
-    await update.message.reply_text("\n".join(lines))
+async def list_cmd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # оставлено для совместимости, если кто-то вызовет /list
+    await list_cmd(update, context)
 
-# ---------- проверка & уведомления ----------
+# ---------- алерты ----------
 async def _check_and_alert(app: Application) -> None:
     try:
         ratio, bnb, sol, source, stale = await ensure_price(force_refresh=False)
@@ -340,7 +445,7 @@ async def _check_and_alert(app: Application) -> None:
             stale_note = " (stale)" if stale else ""
             text = "\n".join(hit_msgs) + f"\nBNB/SOL={ratio:.6f}{stale_note} (src={source})"
             try:
-                await app.bot.send_message(chat_id=chat_id, text=text)
+                await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=_build_main_kb())
             except Exception as e:
                 logger.warning("Не удалось отправить сообщение в %s: %s", chat_id, e)
 
@@ -349,13 +454,6 @@ async def _check_and_alert(app: Application) -> None:
             watches[chat_id]["above"] = [x for x in watches[chat_id]["above"] if x not in rem["above"]]
         if "below" in rem:
             watches[chat_id]["below"] = [x for x in watches[chat_id]["below"] if x not in rem["below"]]
-
-async def _background_loop(app: Application, interval: int) -> None:
-    await asyncio.sleep(5)
-    logger.info("Запущен asyncio-таймер: интервал %s сек", interval)
-    while True:
-        await _check_and_alert(app)
-        await asyncio.sleep(interval)
 
 # ---------- init & main ----------
 async def _post_init(app: Application) -> None:
@@ -370,7 +468,11 @@ def main() -> None:
     app.add_handler(CommandHandler("watch_above", watch_above_cmd))
     app.add_handler(CommandHandler("watch_below", watch_below_cmd))
     app.add_handler(CommandHandler("unwatch", unwatch_cmd))
-    app.add_handler(CommandHandler("list", list_cmd))
+    app.add_handler(CommandHandler("list", list_cmd_cmd))
+
+    # кнопки
+    app.add_handler(CallbackQueryHandler(on_callback))
+
     # на обычный текст просто показываем текущий курс (не форсим обновление)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, price_cmd))
 
@@ -387,6 +489,13 @@ def main() -> None:
         logger.warning("JobQueue не обнаружен — используем asyncio fallback")
 
     app.run_polling(close_loop=False)
+
+async def _background_loop(app: Application, interval: int) -> None:
+    await asyncio.sleep(5)
+    logger.info("Запущен asyncio-таймер: интервал %s сек", interval)
+    while True:
+        await _check_and_alert(app)
+        await asyncio.sleep(interval)
 
 if __name__ == "__main__":
     main()
