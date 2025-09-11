@@ -2,6 +2,9 @@ import os
 import asyncio
 import logging
 import random
+import json
+import re
+from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from time import time
 
@@ -16,7 +19,6 @@ from telegram.ext import (
 )
 from telegram.error import BadRequest
 import aiohttp
-import re
 
 # ---------- базовая настройка ----------
 load_dotenv()
@@ -27,10 +29,50 @@ if not TOKEN:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ---------- хранение алертов ----------
+# Где хранить JSON (подключи Railway Volume и укажи DATA_FILE=/data/watches.json)
+DATA_FILE = os.getenv("DATA_FILE", "watches.json")
+
+# Удалять пороги после срабатывания? (1/true/yes = да, иначе — оставить)
+REMOVE_AFTER_FIRE = os.getenv("REMOVE_AFTER_FIRE", "1").lower() in ("1", "true", "yes")
+
 # Хранилище триггеров: watches[chat_id] = {"above": [...], "below": [...]}
 watches: Dict[int, Dict[str, List[float]]] = {}
 # Ожидание ввода числа от пользователя: pending_input[chat_id] = "above" | "below"
 pending_input: Dict[int, str] = {}
+
+def _save_state():
+    """Атомарно сохраняем алерты в JSON."""
+    try:
+        p = Path(DATA_FILE)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"watches": watches}
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False))
+        tmp.replace(p)
+        logger.info("Сохранены алерты в %s", p)
+    except Exception as e:
+        logger.warning("Не удалось сохранить алерты: %s", e)
+
+def _load_state():
+    """Загружаем алерты из JSON (если есть)."""
+    global watches
+    try:
+        p = Path(DATA_FILE)
+        if not p.exists():
+            logger.info("Файл алертов не найден (%s) — пропускаем загрузку", p)
+            return
+        data = json.loads(p.read_text())
+        raw = data.get("watches", {})
+        watches.clear()
+        for k, v in raw.items():
+            watches[int(k)] = {
+                "above": [float(x) for x in v.get("above", [])],
+                "below": [float(x) for x in v.get("below", [])],
+            }
+        logger.info("Загружены алерты: %d чатов", len(watches))
+    except Exception as e:
+        logger.warning("Не удалось загрузить алерты: %s", e)
 
 # ---------- параметры (ENV-переменные) ----------
 POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "60"))   # период фоновой проверки
@@ -311,6 +353,15 @@ async def _safe_edit(q, text: str, **kwargs):
         else:
             raise
 
+# ---------- вспомогательные ----------
+def _ensure_chat_entry(chat_id: int) -> None:
+    if chat_id not in watches:
+        watches[chat_id] = {"above": [], "below": []}
+
+def _parse_threshold_text(text: str) -> float:
+    t = text.strip().replace(",", ".")
+    return float(t)
+
 # ---------- мгновенная проверка добавленных порогов ----------
 async def _maybe_fire_immediately(chat_id: int, app: Application) -> None:
     try:
@@ -322,16 +373,20 @@ async def _maybe_fire_immediately(chat_id: int, app: Application) -> None:
     fired_below = [thr for thr in cfg.get("below", []) if ratio <= thr]
     if not fired_above and not fired_below:
         return
+
     parts = []
     if fired_above:
         parts.append("⤴️ Достигнуты пороги (≥): " + ", ".join(map(str, fired_above)))
-        watches[chat_id]["above"] = [x for x in cfg["above"] if x not in fired_above]
+        if REMOVE_AFTER_FIRE:
+            watches[chat_id]["above"] = [x for x in cfg["above"] if x not in fired_above]
     if fired_below:
         parts.append("⤵️ Достигнуты пороги (≤): " + ", ".join(map(str, fired_below)))
-        watches[chat_id]["below"] = [x for x in cfg["below"] if x not in fired_below]
+        if REMOVE_AFTER_FIRE:
+            watches[chat_id]["below"] = [x for x in cfg["below"] if x not in fired_below]
     stale_note = " (stale)" if stale else ""
     text = "\n".join(parts) + f"\nBNB/SOL={ratio:.6f}{stale_note} (src={source})"
     await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=_build_main_inline())
+    _save_state()  # могли изменить списки
 
 # ---------- команды ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -343,14 +398,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         await update.message.reply_text("Готов к работе. Нажми '📈 Обновить цену' или /price",
                                         reply_markup=_build_main_inline())
-
-def _ensure_chat_entry(chat_id: int) -> None:
-    if chat_id not in watches:
-        watches[chat_id] = {"above": [], "below": []}
-
-def _parse_threshold_text(text: str) -> float:
-    t = text.strip().replace(",", ".")
-    return float(t)
 
 async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
@@ -385,6 +432,8 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             f"BNB={bnb:.4f} USD, SOL={sol:.4f} USD\n"
             f"age={age}s, TTL={PRICE_TTL_SEC}s\n"
             f"cooldowns: v3={_cooldown_left('v3')}s, v2={_cooldown_left('v2')}s, gecko={_cooldown_left('gecko')}s\n"
+            f"REMOVE_AFTER_FIRE={REMOVE_AFTER_FIRE}\n"
+            f"DATA_FILE={DATA_FILE}\n"
         )
     except Exception as e:
         text = f"status error: {e}"
@@ -415,6 +464,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         if data == "alerts:clear":
             watches.pop(chat_id, None)
+            pending_input.pop(chat_id, None)
+            _save_state()
             await _safe_edit(q, "Все алерты сброшены.", reply_markup=_build_main_inline())
             return
 
@@ -429,6 +480,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     watches[chat_id]["above"].remove(thr)
                 if kind == "below" and thr in watches[chat_id]["below"]:
                     watches[chat_id]["below"].remove(thr)
+                _save_state()
             try:
                 ratio, *_ = await ensure_price(force_refresh=False)
             except Exception:
@@ -446,14 +498,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         if data.startswith("watch:above:"):
             thr = float(data.split(":", 2)[2])
-            watches.setdefault(chat_id, {"above": [], "below": []})["above"].append(thr)
+            _ensure_chat_entry(chat_id)
+            watches[chat_id]["above"].append(thr)
+            _save_state()
             await _safe_edit(q, f"Ок! Сообщу, когда BNB/SOL ≥ {thr}", reply_markup=_build_main_inline())
             await _maybe_fire_immediately(chat_id, context.application)
             return
 
         if data.startswith("watch:below:"):
             thr = float(data.split(":", 2)[2])
-            watches.setdefault(chat_id, {"above": [], "below": []})["below"].append(thr)
+            _ensure_chat_entry(chat_id)
+            watches[chat_id]["below"].append(thr)
+            _save_state()
             await _safe_edit(q, f"Ок! Сообщу, когда BNB/SOL ≤ {thr}", reply_markup=_build_main_inline())
             await _maybe_fire_immediately(chat_id, context.application)
             return
@@ -494,6 +550,7 @@ async def watch_above_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         thr = float(context.args[0].replace(",", "."))
         _ensure_chat_entry(chat_id)
         watches[chat_id]["above"].append(thr)
+        _save_state()
         await update.message.reply_text(f"Ок! Сообщу, когда BNB/SOL ≥ {thr}",
                                         reply_markup=_build_main_inline())
         await _maybe_fire_immediately(chat_id, context.application)
@@ -511,6 +568,7 @@ async def watch_below_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         thr = float(context.args[0].replace(",", "."))
         _ensure_chat_entry(chat_id)
         watches[chat_id]["below"].append(thr)
+        _save_state()
         await update.message.reply_text(f"Ок! Сообщу, когда BNB/SOL ≤ {thr}",
                                         reply_markup=_build_main_inline())
         await _maybe_fire_immediately(chat_id, context.application)
@@ -521,6 +579,7 @@ async def unwatch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     chat_id = update.effective_chat.id
     watches.pop(chat_id, None)
     pending_input.pop(chat_id, None)
+    _save_state()
     await update.message.reply_text("Все алерты для этого чата сброшены.",
                                     reply_markup=_build_main_inline())
 
@@ -543,7 +602,6 @@ NUM_RE = re.compile(r"^\s*\d+([.,]\d+)?\s*$")
 async def numeric_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     if chat_id not in pending_input:
-        # если не ждём число — просто покажем цену
         return await price_cmd(update, context)
 
     kind = pending_input.pop(chat_id)
@@ -551,6 +609,7 @@ async def numeric_input_handler(update: Update, context: ContextTypes.DEFAULT_TY
         thr = _parse_threshold_text(update.message.text)
         _ensure_chat_entry(chat_id)
         watches[chat_id][kind].append(thr)
+        _save_state()
         sign = "≥" if kind == "above" else "≤"
         await update.message.reply_text(f"Ок! Сообщу, когда BNB/SOL {sign} {thr}",
                                         reply_markup=_build_main_inline())
@@ -573,11 +632,13 @@ async def _check_and_alert(app: Application) -> None:
         fired_above = [thr for thr in cfg["above"] if ratio >= thr]
         if fired_above:
             hit_msgs.append("⤴️ Достигнуты пороги (≥): " + ", ".join(str(x) for x in fired_above))
-            to_remove.setdefault(chat_id, {}).setdefault("above", []).extend(fired_above)
+            if REMOVE_AFTER_FIRE:
+                to_remove.setdefault(chat_id, {}).setdefault("above", []).extend(fired_above)
         fired_below = [thr for thr in cfg["below"] if ratio <= thr]
         if fired_below:
             hit_msgs.append("⤵️ Достигнуты пороги (≤): " + ", ".join(str(x) for x in fired_below))
-            to_remove.setdefault(chat_id, {}).setdefault("below", []).extend(fired_below)
+            if REMOVE_AFTER_FIRE:
+                to_remove.setdefault(chat_id, {}).setdefault("below", []).extend(fired_below)
         if hit_msgs:
             stale_note = " (stale)" if stale else ""
             text = "\n".join(hit_msgs) + f"\nBNB/SOL={ratio:.6f}{stale_note} (src={source})"
@@ -586,14 +647,21 @@ async def _check_and_alert(app: Application) -> None:
             except Exception as e:
                 logger.warning("Не удалось отправить сообщение в %s: %s", chat_id, e)
 
+    # снимаем сработавшие пороги и сохраняем
+    changed = False
     for chat_id, rem in to_remove.items():
         if "above" in rem:
             watches[chat_id]["above"] = [x for x in watches[chat_id]["above"] if x not in rem["above"]]
+            changed = True
         if "below" in rem:
             watches[chat_id]["below"] = [x for x in watches[chat_id]["below"] if x not in rem["below"]]
+            changed = True
+    if changed:
+        _save_state()
 
 # ---------- init & main ----------
 async def _post_init(app: Application) -> None:
+    _load_state()
     await app.bot.delete_webhook(drop_pending_updates=True)
 
 def main() -> None:
@@ -618,7 +686,7 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.Regex("^➕ Вверх-алерт$"), open_above_menu))
     app.add_handler(MessageHandler(filters.Regex("^➖ Вниз-алерт$"), open_below_menu))
 
-    # числовой ввод должен стоять ВЫШЕ общего fallback'а
+    # числовой ввод — ставим выше fallback
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(NUM_RE), numeric_input_handler))
 
     # на любой другой текст — просто текущий курс
