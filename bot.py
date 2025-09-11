@@ -443,4 +443,196 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 if kind == "below" and thr in watches[chat_id]["below"]:
                     watches[chat_id]["below"].remove(thr)
             try:
-                r
+                ratio, *_ = await ensure_price(force_refresh=False)
+            except Exception:
+                ratio = None
+            await _safe_edit(q, _format_alerts_text(chat_id, ratio),
+                             reply_markup=_build_alerts_kb(chat_id))
+            return
+
+        if data in ("watch:menu_above", "watch:menu_below"):
+            kind = "above" if data.endswith("above") else "below"
+            ratio, bnb, sol, source, stale = await ensure_price(force_refresh=False)
+            await _safe_edit(q, f"Выбери порог для {('⤴️ ABOVE' if kind=='above' else '⤵️ BELOW')}",
+                             reply_markup=_build_watch_kb(ratio, kind))
+            return
+
+        if data.startswith("watch:above:"):
+            thr = float(data.split(":", 2)[2])
+            watches.setdefault(chat_id, {"above": [], "below": []})["above"].append(thr)
+            await _safe_edit(q, f"Ок! Сообщу, когда BNB/SOL ≥ {thr}", reply_markup=_build_main_inline())
+            await _maybe_fire_immediately(chat_id, context.application)
+            return
+
+        if data.startswith("watch:below:"):
+            thr = float(data.split(":", 2)[2])
+            watches.setdefault(chat_id, {"above": [], "below": []})["below"].append(thr)
+            await _safe_edit(q, f"Ок! Сообщу, когда BNB/SOL ≤ {thr}", reply_markup=_build_main_inline())
+            await _maybe_fire_immediately(chat_id, context.application)
+            return
+
+        if data in ("watch:custom_above", "watch:custom_below"):
+            hint = "/watch_above X" if data.endswith("above") else "/watch_below X"
+            await _safe_edit(q, f"Введи свой порог числом. Напр.: {hint}\n"
+                                f"Сейчас удобно взять от текущей цены +/- 5%, 10%.",
+                                reply_markup=_build_main_inline())
+            return
+
+        if data == "nav:back":
+            ratio, bnb, sol, source, stale = await ensure_price(force_refresh=False)
+            await _safe_edit(q, _fmt_main_text(ratio, bnb, sol, source, stale),
+                             reply_markup=_build_main_inline())
+            return
+
+        await _safe_edit(q, "Неизвестная команда.", reply_markup=_build_main_inline())
+
+    except Exception as e:
+        logger.exception("callback failed")
+        await _safe_edit(q, f"Ошибка: {e}", reply_markup=_build_main_inline())
+
+# ---------- ручные команды /watch_* и /unwatch ----------
+def _ensure_chat_entry(chat_id: int) -> None:
+    if chat_id not in watches:
+        watches[chat_id] = {"above": [], "below": []}
+
+def _parse_threshold(arg_list: List[str]) -> float:
+    if not arg_list:
+        raise ValueError("Укажи число, например: 3.2")
+    try:
+        return float(arg_list[0].replace(",", "."))
+    except ValueError:
+        raise ValueError("Неверный формат. Пример: 3.2")
+
+async def watch_above_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        thr = _parse_threshold(context.args)
+        chat_id = update.effective_chat.id
+        _ensure_chat_entry(chat_id)
+        watches[chat_id]["above"].append(thr)
+        await update.message.reply_text(f"Ок! Сообщу, когда BNB/SOL ≥ {thr}",
+                                        reply_markup=_build_main_inline())
+        await _maybe_fire_immediately(chat_id, context.application)
+    except Exception as e:
+        await update.message.reply_text(str(e), reply_markup=_build_main_inline())
+
+async def watch_below_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        thr = _parse_threshold(context.args)
+        chat_id = update.effective_chat.id
+        _ensure_chat_entry(chat_id)
+        watches[chat_id]["below"].append(thr)
+        await update.message.reply_text(f"Ок! Сообщу, когда BNB/SOL ≤ {thr}",
+                                        reply_markup=_build_main_inline())
+        await _maybe_fire_immediately(chat_id, context.application)
+    except Exception as e:
+        await update.message.reply_text(str(e), reply_markup=_build_main_inline())
+
+async def unwatch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    watches.pop(chat_id, None)
+    await update.message.reply_text("Все алерты для этого чата сброшены.",
+                                    reply_markup=_build_main_inline())
+
+async def list_cmd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await list_cmd(update, context)
+
+# ---------- обработчики reply-клавиатуры ----------
+async def open_above_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ratio, bnb, sol, source, stale = await ensure_price(force_refresh=False)
+    await update.message.reply_text(
+        "Выбери порог для ⤴️ ABOVE",
+        reply_markup=_build_watch_kb(ratio, "above")
+    )
+
+async def open_below_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    ratio, bnb, sol, source, stale = await ensure_price(force_refresh=False)
+    await update.message.reply_text(
+        "Выбери порог для ⤵️ BELOW",
+        reply_markup=_build_watch_kb(ratio, "below")
+    )
+
+# ---------- алерты (фон) ----------
+async def _check_and_alert(app: Application) -> None:
+    try:
+        ratio, bnb, sol, source, stale = await ensure_price(force_refresh=True)
+    except Exception as e:
+        logger.warning("Не удалось обновить цены для алертов: %s", e)
+        return
+
+    to_remove: Dict[int, Dict[str, List[float]]] = {}
+    for chat_id, cfg in list(watches.items()):
+        hit_msgs: List[str] = []
+        fired_above = [thr for thr in cfg["above"] if ratio >= thr]
+        if fired_above:
+            hit_msgs.append("⤴️ Достигнуты пороги (≥): " + ", ".join(str(x) for x in fired_above))
+            to_remove.setdefault(chat_id, {}).setdefault("above", []).extend(fired_above)
+        fired_below = [thr for thr in cfg["below"] if ratio <= thr]
+        if fired_below:
+            hit_msgs.append("⤵️ Достигнуты пороги (≤): " + ", ".join(str(x) for x in fired_below))
+            to_remove.setdefault(chat_id, {}).setdefault("below", []).extend(fired_below)
+        if hit_msgs:
+            stale_note = " (stale)" if stale else ""
+            text = "\n".join(hit_msgs) + f"\nBNB/SOL={ratio:.6f}{stale_note} (src={source})"
+            try:
+                await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=_build_main_inline())
+            except Exception as e:
+                logger.warning("Не удалось отправить сообщение в %s: %s", chat_id, e)
+
+    for chat_id, rem in to_remove.items():
+        if "above" in rem:
+            watches[chat_id]["above"] = [x for x in watches[chat_id]["above"] if x not in rem["above"]]
+        if "below" in rem:
+            watches[chat_id]["below"] = [x for x in watches[chat_id]["below"] if x not in rem["below"]]
+
+# ---------- init & main ----------
+async def _post_init(app: Application) -> None:
+    await app.bot.delete_webhook(drop_pending_updates=True)
+
+def main() -> None:
+    app = Application.builder().token(TOKEN).post_init(_post_init).build()
+
+    # команды
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("price", price_cmd))
+    app.add_handler(CommandHandler("watch_above", watch_above_cmd))
+    app.add_handler(CommandHandler("watch_below", watch_below_cmd))
+    app.add_handler(CommandHandler("unwatch", unwatch_cmd))
+    app.add_handler(CommandHandler("list", list_cmd_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+
+    # инлайн-кнопки
+    app.add_handler(CallbackQueryHandler(on_callback))
+
+    # reply-клавиатура (кнопки у поля ввода)
+    app.add_handler(MessageHandler(filters.Regex("^📈 Обновить цену$"), price_cmd))
+    app.add_handler(MessageHandler(filters.Regex("^🔔 Список$"), list_cmd))
+    app.add_handler(MessageHandler(filters.Regex("^🧹 Сбросить$"), unwatch_cmd))
+    app.add_handler(MessageHandler(filters.Regex("^➕ Вверх-алерт$"), open_above_menu))
+    app.add_handler(MessageHandler(filters.Regex("^➖ Вниз-алерт$"), open_below_menu))
+
+    # на любой другой текст — просто текущий курс
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, price_cmd))
+
+    # Планировщик/таймер
+    jq = getattr(app, "job_queue", None)
+    if jq is not None:
+        jq.run_repeating(lambda ctx: _check_and_alert(app), interval=POLL_INTERVAL_SEC, first=5)
+        logger.info("JobQueue активен (интервал %s сек)", POLL_INTERVAL_SEC)
+    else:
+        try:
+            app.create_task(_background_loop(app, POLL_INTERVAL_SEC))
+        except Exception:
+            asyncio.get_event_loop().create_task(_background_loop(app, POLL_INTERVAL_SEC))
+        logger.warning("JobQueue не обнаружен — используем asyncio fallback")
+
+    app.run_polling(close_loop=False)
+
+async def _background_loop(app: Application, interval: int) -> None:
+    await asyncio.sleep(5)
+    logger.info("Запущен asyncio-таймер: интервал %s сек", interval)
+    while True:
+        await _check_and_alert(app)
+        await asyncio.sleep(interval)
+
+if __name__ == "__main__":
+    main()
