@@ -16,6 +16,7 @@ from telegram.ext import (
 )
 from telegram.error import BadRequest
 import aiohttp
+import re
 
 # ---------- базовая настройка ----------
 load_dotenv()
@@ -28,6 +29,8 @@ logger = logging.getLogger(__name__)
 
 # Хранилище триггеров: watches[chat_id] = {"above": [...], "below": [...]}
 watches: Dict[int, Dict[str, List[float]]] = {}
+# Ожидание ввода числа от пользователя: pending_input[chat_id] = "above" | "below"
+pending_input: Dict[int, str] = {}
 
 # ---------- параметры (ENV-переменные) ----------
 POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "60"))   # период фоновой проверки
@@ -37,18 +40,10 @@ V2_COOLDOWN_SEC   = int(os.getenv("V2_COOLDOWN_SEC", "60"))
 GECKO_COOLDOWN_SEC= int(os.getenv("GECKO_COOLDOWN_SEC", "120"))
 
 # ---------- источники цен ----------
-# v3 (The Graph / PancakeSwap Exchange v3, BSC)
 GRAPH_API_KEY = os.getenv("GRAPH_API_KEY")  # если пусто — будет фоллбек
-GRAPH_SUBGRAPH_ID = os.getenv(
-    "GRAPH_SUBGRAPH_ID",
-    "Hv1GncLY5docZoGtXjo4kwbTvxm3MAhVZqBZE4sUT9eZ"
-)
+GRAPH_SUBGRAPH_ID = os.getenv("GRAPH_SUBGRAPH_ID", "Hv1GncLY5docZoGtXjo4kwbTvxm3MAhVZqBZE4sUT9eZ")
 GRAPH_URL = f"https://gateway.thegraph.com/api/subgraphs/id/{GRAPH_SUBGRAPH_ID}"
-
-# v2 (Pancake Info API)
 PANCAKE_API = os.getenv("PANCAKE_API", "https://api.pancakeswap.info/api/v2/tokens")
-
-# CoinGecko (аварийный фоллбек)
 COINGECKO = "https://api.coingecko.com/api/v3/simple/price"
 
 # Адреса токенов на BSC (в нижнем регистре)
@@ -74,10 +69,7 @@ class RateLimitError(Exception):
 async def _gql(session: aiohttp.ClientSession, query: str, variables: dict):
     if not GRAPH_API_KEY:
         raise RuntimeError("GRAPH_API_KEY не задан")
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {GRAPH_API_KEY}",
-    }
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {GRAPH_API_KEY}"}
     payload = {"query": query, "variables": variables}
     async with session.post(GRAPH_URL, json=payload, headers=headers, timeout=20) as resp:
         text = await resp.text()
@@ -92,7 +84,6 @@ async def _gql(session: aiohttp.ClientSession, query: str, variables: dict):
         return data["data"]
 
 async def _get_json_with_retries(session: aiohttp.ClientSession, url: str, *, attempts=3, **kwargs):
-    """GET JSON с ретраями (0.5s, 1.5s, 3s), 429 -> RateLimitError, 5xx -> RuntimeError."""
     delays = [0.5, 1.5, 3.0]
     last_exc = None
     for i in range(attempts):
@@ -161,7 +152,6 @@ def _cooldown_active(source: str) -> bool:
 
 async def _fetch_and_update() -> bool:
     async with aiohttp.ClientSession() as session:
-        # 1) v3
         if GRAPH_API_KEY and not _cooldown_active("v3"):
             try:
                 bnb, sol = await _prices_v3(session)
@@ -179,7 +169,6 @@ async def _fetch_and_update() -> bool:
                 _cooldown_set("v3", V3_COOLDOWN_SEC)
                 state.last_error = str(e)
 
-        # 2) v2
         if not _cooldown_active("v2"):
             try:
                 bnb, sol = await _prices_v2(session)
@@ -197,7 +186,6 @@ async def _fetch_and_update() -> bool:
                 _cooldown_set("v2", V2_COOLDOWN_SEC)
                 state.last_error = str(e)
 
-        # 3) gecko
         if not _cooldown_active("gecko"):
             try:
                 bnb, sol = await _prices_gecko(session)
@@ -218,7 +206,6 @@ async def _fetch_and_update() -> bool:
     return False
 
 async def ensure_price(force_refresh: bool = False):
-    """Возвращает (ratio, bnb, sol, source, stale)."""
     stale = (time() - state.last_updated) > PRICE_TTL_SEC
     if force_refresh or stale or state.last_ratio is None:
         updated = await _fetch_and_update()
@@ -298,19 +285,16 @@ def _format_alerts_text(chat_id: int, ratio: Optional[float]) -> str:
 def _build_alerts_kb(chat_id: int) -> InlineKeyboardMarkup:
     cfg = watches.get(chat_id, {"above": [], "below": []})
     kb: List[List[InlineKeyboardButton]] = []
-    # ABOVE
     ab = sorted(cfg.get("above", []))
     if ab:
         for i in range(0, len(ab), 3):
             chunk = ab[i:i+3]
             kb.append([InlineKeyboardButton(f"❌ {v}", callback_data=f"alerts:del:above:{v}") for v in chunk])
-    # BELOW
     bl = sorted(cfg.get("below", []))
     if bl:
         for i in range(0, len(bl), 3):
             chunk = bl[i:i+3]
             kb.append([InlineKeyboardButton(f"❌ {v}", callback_data=f"alerts:del:below:{v}") for v in chunk])
-    # Низ
     kb.append([
         InlineKeyboardButton("🧹 Очистить все", callback_data="alerts:clear"),
         InlineKeyboardButton("⬅️ Назад", callback_data="nav:back"),
@@ -354,26 +338,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Клавиатура включена ↓", reply_markup=_build_reply_kb())
     try:
         ratio, bnb, sol, source, stale = await ensure_price(force_refresh=False)
-        await update.message.reply_text(
-            _fmt_main_text(ratio, bnb, sol, source, stale),
-            reply_markup=_build_main_inline(),
-        )
+        await update.message.reply_text(_fmt_main_text(ratio, bnb, sol, source, stale),
+                                        reply_markup=_build_main_inline())
     except Exception:
-        await update.message.reply_text(
-            "Готов к работе. Нажми '📈 Обновить цену' или /price",
-            reply_markup=_build_main_inline()
-        )
+        await update.message.reply_text("Готов к работе. Нажми '📈 Обновить цену' или /price",
+                                        reply_markup=_build_main_inline())
+
+def _ensure_chat_entry(chat_id: int) -> None:
+    if chat_id not in watches:
+        watches[chat_id] = {"above": [], "below": []}
+
+def _parse_threshold_text(text: str) -> float:
+    t = text.strip().replace(",", ".")
+    return float(t)
 
 async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         ratio, bnb, sol, source, stale = await ensure_price(force_refresh=False)
-        await update.message.reply_text(
-            _fmt_main_text(ratio, bnb, sol, source, stale),
-            reply_markup=_build_main_inline(),
-        )
+        await update.message.reply_text(_fmt_main_text(ratio, bnb, sol, source, stale),
+                                        reply_markup=_build_main_inline())
     except Exception as e:
         logger.exception("price cmd failed")
-        await update.message.reply_text(f"Не удалось получить цену: {e}", reply_markup=_build_main_inline())
+        await update.message.reply_text(f"Не удалось получить цену: {e}",
+                                        reply_markup=_build_main_inline())
 
 async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
@@ -381,8 +368,8 @@ async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ratio, *_ = await ensure_price(force_refresh=False)
     except Exception:
         ratio = None
-    text = _format_alerts_text(chat_id, ratio)
-    await update.message.reply_text(text, reply_markup=_build_alerts_kb(chat_id))
+    await update.message.reply_text(_format_alerts_text(chat_id, ratio),
+                                    reply_markup=_build_alerts_kb(chat_id))
 
 def _cooldown_left(name: str) -> int:
     from time import time as now
@@ -471,11 +458,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await _maybe_fire_immediately(chat_id, context.application)
             return
 
-        if data in ("watch:custom_above", "watch:custom_below"):
-            hint = "/watch_above X" if data.endswith("above") else "/watch_below X"
-            await _safe_edit(q, f"Введи свой порог числом. Напр.: {hint}\n"
-                                f"Сейчас удобно взять от текущей цены +/- 5%, 10%.",
-                                reply_markup=_build_main_inline())
+        if data == "watch:custom_above":
+            pending_input[chat_id] = "above"
+            await _safe_edit(q, "Введи свой порог для ⤴️ ABOVE числом (например, 3.2)",
+                             reply_markup=_build_main_inline())
+            return
+
+        if data == "watch:custom_below":
+            pending_input[chat_id] = "below"
+            await _safe_edit(q, "Введи свой порог для ⤵️ BELOW числом (например, 3.2)",
+                             reply_markup=_build_main_inline())
             return
 
         if data == "nav:back":
@@ -491,22 +483,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _safe_edit(q, f"Ошибка: {e}", reply_markup=_build_main_inline())
 
 # ---------- ручные команды /watch_* и /unwatch ----------
-def _ensure_chat_entry(chat_id: int) -> None:
-    if chat_id not in watches:
-        watches[chat_id] = {"above": [], "below": []}
-
-def _parse_threshold(arg_list: List[str]) -> float:
-    if not arg_list:
-        raise ValueError("Укажи число, например: 3.2")
-    try:
-        return float(arg_list[0].replace(",", "."))
-    except ValueError:
-        raise ValueError("Неверный формат. Пример: 3.2")
-
 async def watch_above_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    if not context.args:
+        pending_input[chat_id] = "above"
+        await update.message.reply_text("Введи свой порог для ⤴️ ABOVE числом (например, 3.2)",
+                                        reply_markup=_build_main_inline())
+        return
     try:
-        thr = _parse_threshold(context.args)
-        chat_id = update.effective_chat.id
+        thr = float(context.args[0].replace(",", "."))
         _ensure_chat_entry(chat_id)
         watches[chat_id]["above"].append(thr)
         await update.message.reply_text(f"Ок! Сообщу, когда BNB/SOL ≥ {thr}",
@@ -516,9 +501,14 @@ async def watch_above_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text(str(e), reply_markup=_build_main_inline())
 
 async def watch_below_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    if not context.args:
+        pending_input[chat_id] = "below"
+        await update.message.reply_text("Введи свой порог для ⤵️ BELOW числом (например, 3.2)",
+                                        reply_markup=_build_main_inline())
+        return
     try:
-        thr = _parse_threshold(context.args)
-        chat_id = update.effective_chat.id
+        thr = float(context.args[0].replace(",", "."))
         _ensure_chat_entry(chat_id)
         watches[chat_id]["below"].append(thr)
         await update.message.reply_text(f"Ок! Сообщу, когда BNB/SOL ≤ {thr}",
@@ -530,6 +520,7 @@ async def watch_below_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def unwatch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     watches.pop(chat_id, None)
+    pending_input.pop(chat_id, None)
     await update.message.reply_text("Все алерты для этого чата сброшены.",
                                     reply_markup=_build_main_inline())
 
@@ -539,17 +530,34 @@ async def list_cmd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ---------- обработчики reply-клавиатуры ----------
 async def open_above_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ratio, bnb, sol, source, stale = await ensure_price(force_refresh=False)
-    await update.message.reply_text(
-        "Выбери порог для ⤴️ ABOVE",
-        reply_markup=_build_watch_kb(ratio, "above")
-    )
+    await update.message.reply_text("Выбери порог для ⤴️ ABOVE",
+                                    reply_markup=_build_watch_kb(ratio, "above"))
 
 async def open_below_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ratio, bnb, sol, source, stale = await ensure_price(force_refresh=False)
-    await update.message.reply_text(
-        "Выбери порог для ⤵️ BELOW",
-        reply_markup=_build_watch_kb(ratio, "below")
-    )
+    await update.message.reply_text("Выбери порог для ⤵️ BELOW",
+                                    reply_markup=_build_watch_kb(ratio, "below"))
+
+# ---------- обработчик числового ввода ----------
+NUM_RE = re.compile(r"^\s*\d+([.,]\d+)?\s*$")
+async def numeric_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    if chat_id not in pending_input:
+        # если не ждём число — просто покажем цену
+        return await price_cmd(update, context)
+
+    kind = pending_input.pop(chat_id)
+    try:
+        thr = _parse_threshold_text(update.message.text)
+        _ensure_chat_entry(chat_id)
+        watches[chat_id][kind].append(thr)
+        sign = "≥" if kind == "above" else "≤"
+        await update.message.reply_text(f"Ок! Сообщу, когда BNB/SOL {sign} {thr}",
+                                        reply_markup=_build_main_inline())
+        await _maybe_fire_immediately(chat_id, context.application)
+    except Exception as e:
+        await update.message.reply_text(f"Не понял число. Пример: 3.2\nОшибка: {e}",
+                                        reply_markup=_build_main_inline())
 
 # ---------- алерты (фон) ----------
 async def _check_and_alert(app: Application) -> None:
@@ -609,6 +617,9 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.Regex("^🧹 Сбросить$"), unwatch_cmd))
     app.add_handler(MessageHandler(filters.Regex("^➕ Вверх-алерт$"), open_above_menu))
     app.add_handler(MessageHandler(filters.Regex("^➖ Вниз-алерт$"), open_below_menu))
+
+    # числовой ввод должен стоять ВЫШЕ общего fallback'а
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.Regex(NUM_RE), numeric_input_handler))
 
     # на любой другой текст — просто текущий курс
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, price_cmd))
