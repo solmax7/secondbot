@@ -245,4 +245,202 @@ def _build_main_inline() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("🔔 Список", callback_data="alerts:list"),
-            InlineKeyboardButton("🧹 Сброси
+            InlineKeyboardButton("🧹 Сбросить", callback_data="alerts:clear"),
+        ],
+    ])
+
+def _build_reply_kb() -> ReplyKeyboardMarkup:
+    rows = [
+        ["📈 Обновить цену"],
+        ["➕ Вверх-алерт", "➖ Вниз-алерт"],
+        ["🔔 Список", "🧹 Сбросить"],
+    ]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+def _preset_thresholds(ratio: float):
+    above = [round(ratio * m, 4) for m in (1.02, 1.05, 1.10)]
+    below = [round(ratio * m, 4) for m in (0.98, 0.95, 0.90)]
+    return above, below
+
+def _build_watch_kb(ratio: float, kind: str) -> InlineKeyboardMarkup:
+    above, below = _preset_thresholds(ratio)
+    if kind == "above":
+        row = [InlineKeyboardButton(f"{v}", callback_data=f"watch:above:{v}") for v in above]
+        extra = InlineKeyboardButton("✏️ Свой", callback_data="watch:custom_above")
+    else:
+        row = [InlineKeyboardButton(f"{v}", callback_data=f"watch:below:{v}") for v in below]
+        extra = InlineKeyboardButton("✏️ Свой", callback_data="watch:custom_below")
+    return InlineKeyboardMarkup([
+        row,
+        [extra],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="nav:back")],
+    ])
+
+def _format_alerts_text(chat_id: int, ratio: Optional[float]) -> str:
+    cfg = watches.get(chat_id, {"above": [], "below": []})
+    ab = sorted(cfg.get("above", []))
+    bl = sorted(cfg.get("below", []))
+    if not ab and not bl:
+        return "Алертов нет. Добавь пороги кнопками или командами /watch_above и /watch_below."
+    head = f"Текущий BNB/SOL: {ratio:.6f}\n" if ratio else ""
+    s = [head + "Активные алерты:"]
+    if ab:
+        s.append("⤴️ ABOVE:")
+        for i, v in enumerate(ab, 1):
+            s.append(f"  {i}. ≥ {v}")
+    if bl:
+        s.append("⤵️ BELOW:")
+        for i, v in enumerate(bl, 1):
+            s.append(f"  {i}. ≤ {v}")
+    s.append("\nНажми на кнопку с ❌ чтобы удалить конкретный порог.")
+    return "\n".join(s)
+
+def _build_alerts_kb(chat_id: int) -> InlineKeyboardMarkup:
+    cfg = watches.get(chat_id, {"above": [], "below": []})
+    kb: List[List[InlineKeyboardButton]] = []
+    # ABOVE
+    ab = sorted(cfg.get("above", []))
+    if ab:
+        for i in range(0, len(ab), 3):
+            chunk = ab[i:i+3]
+            kb.append([InlineKeyboardButton(f"❌ {v}", callback_data=f"alerts:del:above:{v}") for v in chunk])
+    # BELOW
+    bl = sorted(cfg.get("below", []))
+    if bl:
+        for i in range(0, len(bl), 3):
+            chunk = bl[i:i+3]
+            kb.append([InlineKeyboardButton(f"❌ {v}", callback_data=f"alerts:del:below:{v}") for v in chunk])
+    # Низ
+    kb.append([
+        InlineKeyboardButton("🧹 Очистить все", callback_data="alerts:clear"),
+        InlineKeyboardButton("⬅️ Назад", callback_data="nav:back"),
+    ])
+    return InlineKeyboardMarkup(kb)
+
+# ---------- безопасное редактирование ----------
+async def _safe_edit(q, text: str, **kwargs):
+    try:
+        await q.edit_message_text(text, **kwargs)
+    except BadRequest as e:
+        if "Message is not modified" in str(e):
+            await q.answer("Без изменений")
+        else:
+            raise
+
+# ---------- мгновенная проверка добавленных порогов ----------
+async def _maybe_fire_immediately(chat_id: int, app: Application) -> None:
+    try:
+        ratio, bnb, sol, source, stale = await ensure_price(force_refresh=False)
+    except Exception:
+        return
+    cfg = watches.get(chat_id, {"above": [], "below": []})
+    fired_above = [thr for thr in cfg.get("above", []) if ratio >= thr]
+    fired_below = [thr for thr in cfg.get("below", []) if ratio <= thr]
+    if not fired_above and not fired_below:
+        return
+    parts = []
+    if fired_above:
+        parts.append("⤴️ Достигнуты пороги (≥): " + ", ".join(map(str, fired_above)))
+        watches[chat_id]["above"] = [x for x in cfg["above"] if x not in fired_above]
+    if fired_below:
+        parts.append("⤵️ Достигнуты пороги (≤): " + ", ".join(map(str, fired_below)))
+        watches[chat_id]["below"] = [x for x in cfg["below"] if x not in fired_below]
+    stale_note = " (stale)" if stale else ""
+    text = "\n".join(parts) + f"\nBNB/SOL={ratio:.6f}{stale_note} (src={source})"
+    await app.bot.send_message(chat_id=chat_id, text=text, reply_markup=_build_main_inline())
+
+# ---------- команды ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Клавиатура включена ↓", reply_markup=_build_reply_kb())
+    try:
+        ratio, bnb, sol, source, stale = await ensure_price(force_refresh=False)
+        await update.message.reply_text(
+            _fmt_main_text(ratio, bnb, sol, source, stale),
+            reply_markup=_build_main_inline(),
+        )
+    except Exception:
+        await update.message.reply_text(
+            "Готов к работе. Нажми '📈 Обновить цену' или /price",
+            reply_markup=_build_main_inline()
+        )
+
+async def price_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        ratio, bnb, sol, source, stale = await ensure_price(force_refresh=False)
+        await update.message.reply_text(
+            _fmt_main_text(ratio, bnb, sol, source, stale),
+            reply_markup=_build_main_inline(),
+        )
+    except Exception as e:
+        logger.exception("price cmd failed")
+        await update.message.reply_text(f"Не удалось получить цену: {e}", reply_markup=_build_main_inline())
+
+async def list_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    try:
+        ratio, *_ = await ensure_price(force_refresh=False)
+    except Exception:
+        ratio = None
+    text = _format_alerts_text(chat_id, ratio)
+    await update.message.reply_text(text, reply_markup=_build_alerts_kb(chat_id))
+
+def _cooldown_left(name: str) -> int:
+    from time import time as now
+    left = int(state.cooldowns.get(name, 0) - now())
+    return max(0, left)
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        ratio, bnb, sol, source, stale = await ensure_price(force_refresh=False)
+        age = int(time() - state.last_updated) if state.last_updated else -1
+        text = (
+            f"BNB/SOL: {ratio:.6f} (src={source}{' stale' if stale else ''})\n"
+            f"BNB={bnb:.4f} USD, SOL={sol:.4f} USD\n"
+            f"age={age}s, TTL={PRICE_TTL_SEC}s\n"
+            f"cooldowns: v3={_cooldown_left('v3')}s, v2={_cooldown_left('v2')}s, gecko={_cooldown_left('gecko')}s\n"
+        )
+    except Exception as e:
+        text = f"status error: {e}"
+    await update.message.reply_text(text, reply_markup=_build_main_inline())
+
+# ---------- обработка callback-кнопок ----------
+async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+    chat_id = update.effective_chat.id
+
+    try:
+        if data == "price:refresh":
+            ratio, bnb, sol, source, stale = await ensure_price(force_refresh=True)
+            await _safe_edit(q, _fmt_main_text(ratio, bnb, sol, source, stale),
+                             reply_markup=_build_main_inline())
+            return
+
+        if data == "alerts:list":
+            try:
+                ratio, *_ = await ensure_price(force_refresh=False)
+            except Exception:
+                ratio = None
+            await _safe_edit(q, _format_alerts_text(chat_id, ratio),
+                             reply_markup=_build_alerts_kb(chat_id))
+            return
+
+        if data == "alerts:clear":
+            watches.pop(chat_id, None)
+            await _safe_edit(q, "Все алерты сброшены.", reply_markup=_build_main_inline())
+            return
+
+        if data.startswith("alerts:del:"):
+            _, _, kind, val = data.split(":", 3)
+            try:
+                thr = float(val)
+            except ValueError:
+                thr = None
+            if thr is not None and chat_id in watches:
+                if kind == "above" and thr in watches[chat_id]["above"]:
+                    watches[chat_id]["above"].remove(thr)
+                if kind == "below" and thr in watches[chat_id]["below"]:
+                    watches[chat_id]["below"].remove(thr)
+            try:
+                r
